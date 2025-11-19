@@ -1,0 +1,9 @@
+---
+- name: Execute command on remote server
+  hosts: webservers
+  tasks:
+    - name: Ping my home IP
+      shell: "ping -c 3 159.196.95.225"
+      register: command_output # Optional: Store output in a variable
+    - debug:
+        var: command_output.stdout_lines # Optional: Display the output
