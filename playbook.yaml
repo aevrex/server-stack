@@ -1,9 +1,196 @@
----
-- name: Execute command on remote server
-  hosts: webservers
+- name: Install Docker (Idempotent)
+  hosts: hetzner_servers
+  become: true
+  vars:
+    npm_version: 'latest'
+    db_root_password: 'Fxz@574896523'
+    db_user: 'npm'
+    db_password: 'Fxz@4574896523'
+    db_name: 'npm'
+    pg_password: "Fxz4574896523"
+    n8n_domain: "n8n.aevra.dev"
+    pg_user: "n8nuser"
+    pg_db_name: "n8n"
+    timezone: "Australia/Perth"
+
   tasks:
-    - name: Ping my home IP
-      shell: "ping -c 3 159.196.95.225"
-      register: command_output # Optional: Store output in a variable
-    - debug:
-        var: command_output.stdout_lines # Optional: Display the output
+    - name: Remove conflicting packages
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose
+          - docker-doc
+          - podman-docker
+          - containerd
+          - runc
+        state: absent
+        autoremove: true
+
+    - name: Add Docker’s official GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      ansible.builtin.apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu focal stable
+        state: present
+        update_cache: true
+
+    - name: Install Docker packages
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+          - docker-compose
+        update_cache: true
+        state: latest
+
+    - name: Check Docker service status
+      ansible.builtin.service_facts:
+
+    - name: Create Portainer volume
+      ansible.builtin.shell: docker volume create portainer_data
+
+    - name: Install Portainer
+      community.docker.docker_container:
+        name: portainer
+        image: portainer/portainer-ce:lts
+        recreate: true
+        ports:
+          - '8000:8000'
+          - '9443:9443'
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - portainer_data:/data
+        restart_policy: always
+
+    - name: Ensure python3-pip is installed
+      ansible.builtin.apt:
+        name: python3-pip
+        state: present
+
+    - name: Install Python Docker SDK using apt
+      ansible.builtin.apt:
+        name: python3-docker
+        state: present
+
+    - name: Create NPM data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /path/to/npm/data
+        - /path/to/npm/letsencrypt
+        - /path/to/npm/data/mysql
+
+    - name: Stop and remove existing N8N stack
+      community.docker.docker_compose:
+        project_src: /opt/n8n/
+        state: absent
+      ignore_errors: true
+
+    - name: Stop and remove existing NPM stack
+      community.docker.docker_compose:
+        project_src: /path/to/npm/
+        state: absent
+      ignore_errors: true
+
+    - name: Copy Docker Compose file (npm) to the remote host
+      ansible.builtin.copy:
+        content: |
+          version: '3'
+          services:
+            app:
+              image: 'jc21/nginx-proxy-manager:{{ npm_version }}'
+              restart: unless-stopped
+              network_mode: "host" 
+              environment:
+                DB_MYSQL_HOST: 127.0.0.1 
+                DB_MYSQL_PORT: 3306
+                DB_MYSQL_USER: {{ db_user }}
+                DB_MYSQL_PASSWORD: {{ db_password }}
+                DB_MYSQL_DATABASE: {{ db_name }}
+              volumes:
+                - /path/to/npm/data:/data
+                - /path/to/npm/letsencrypt:/etc/letsencrypt
+            db:
+              image: 'jc21/mariadb-aria:latest'
+              restart: unless-stopped
+              network_mode: "host" 
+              environment:
+                MYSQL_ROOT_PASSWORD: {{ db_root_password }}
+                MYSQL_DATABASE: {{ db_name }}
+                MYSQL_USER: {{ db_user }}
+                MYSQL_PASSWORD: {{ db_password }}
+              volumes:
+                - /path/to/npm/data/mysql:/var/lib/mysql
+        dest: /path/to/npm/docker-compose.yml
+        mode: '0644'
+
+    - name: Start services using Docker Compose (NPM)
+      community.docker.docker_compose:
+        project_src: /path/to/npm/
+        state: present
+
+    - name: Ensure /opt/n8n application directory exists
+      ansible.builtin.file:
+        path: /opt/n8n
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Copy n8n Docker Compose file (n8n) to the remote host (FIXED)
+      ansible.builtin.copy:
+        content: |
+          version: '3.7'
+          services:
+            n8n:
+              image: n8nio/n8n:latest
+              container_name: n8n_server
+              restart: unless-stopped
+              # Network mode removed to enable container-to-container communication by service name
+              environment:
+                - N8N_PROTOCOL=https
+                - WEBHOOK_URL=https://{{ n8n_domain }}/
+                - N8N_EDITOR_BASE_URL=https://{{ n8n_domain }}/
+                - DB_TYPE=postgresdb
+                - DB_HOST=postgres # Container name used for internal communication
+                - DB_PORT=5432
+                - DB_NAME={{ pg_db_name | default('n8n') }}
+                - DB_USER={{ pg_user | default('n8nuser') }}
+                - DB_PASSWORD={{ pg_password }}
+                - N8N_HOST=127.0.0.1 # This is internal to n8n container, correct
+                - N8N_PORT=5678
+                - TZ={{ timezone | default('UTC') }}
+              volumes:
+                - /opt/n8n/data:/home/node/.n8n
+            postgres:
+              image: postgres:15-alpine
+              container_name: n8n_postgres
+              restart: unless-stopped
+              # Network mode removed. Docker creates a bridge network by default.
+              environment:
+                - POSTGRES_USER={{ pg_user | default('n8nuser') }}
+                - POSTGRES_PASSWORD={{ pg_password }} 
+                - POSTGRES_DB={{ pg_db_name | default('n8n') }}
+        dest: /opt/n8n/docker-compose.yml
+        mode: '0644'
+
+    - name: Fix permissions for n8n data volume
+      ansible.builtin.file:
+        path: /opt/n8n/data
+        owner: 1000
+        group: 1000
+        mode: '0775'
+        recurse: true
+
+    - name: Start the n8n Docker stack
+      community.docker.docker_compose:
+        project_src: /opt/n8n/
+        state: present
